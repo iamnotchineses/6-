@@ -361,11 +361,14 @@ with c_right:
 st.subheader("📈 목표")
 year_t = float(yearly["목표"].sum())            # 1년 전체 목표
 cum_a = float(yearly["실제"][:month].sum())     # 누적 실제
+cum_t = float(yearly["목표"][:month].sum())     # 경과월(1~당월) 목표 합
 ach = cum_a / year_t if year_t else 0.0
-mc = st.columns(3)
+ach_now = cum_a / cum_t if cum_t else 0.0
+mc = st.columns(4)
 mc[0].metric("연간 목표", f"{year_t/1e8:,.1f}억")
 mc[1].metric("누적 실제", f"{cum_a/1e8:,.1f}억")
-mc[2].metric("목표달성율", f"{ach:.1%}")
+mc[2].metric(f"현재까지 달성율 (~{month}월 목표 {cum_t/1e8:,.0f}억)", f"{ach_now:.1%}")
+mc[3].metric("연간 달성율", f"{ach:.1%}")
 fig = go.Figure()
 fig.add_bar(x=yearly["월"], y=yearly["목표"], name="목표", marker_color="#cbd5e1")
 fig.add_bar(x=yearly["월"], y=yearly["실제"], name="실제", marker_color="#2563eb")
