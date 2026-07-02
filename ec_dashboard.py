@@ -187,8 +187,9 @@ def load(file_bytes: bytes):
     months, targets, actuals = [], [], []
     col = 8
     for m in range(1, 13):
-        targets.append(_num(wy.cell(6, col).value))
-        actuals.append(_num(wy.cell(6, col + 1).value))
+        # 병행 합계행(6) + 공식 합계행(57)
+        targets.append(_num(wy.cell(6, col).value) + _num(wy.cell(57, col).value))
+        actuals.append(_num(wy.cell(6, col + 1).value) + _num(wy.cell(57, col + 1).value))
         months.append(f"{m}월")
         col += 3
     yearly = pd.DataFrame({"월": months, "목표": targets, "실제": actuals})
