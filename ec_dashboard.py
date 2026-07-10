@@ -179,6 +179,10 @@ def load(file_bytes: bytes):
             "예상마감": _num(ws.cell(r, 22).value),
             "예상달성율": (_num(ws.cell(r, 22).value) / _num(ws.cell(r, 11).value))
                           if _num(ws.cell(r, 11).value) else None,
+            "전년대비(예상)": (_num(ws.cell(r, 22).value) / _num(ws.cell(r, 6).value) - 1)
+                             if _num(ws.cell(r, 6).value) else None,
+            "전월대비(예상)": (_num(ws.cell(r, 22).value) / _num(ws.cell(r, 18).value) - 1)
+                             if _num(ws.cell(r, 18).value) else None,
             "전년대비": _num(ws.cell(r, 29).value), "전월대비": _num(ws.cell(r, 31).value),
         })
     df = pd.DataFrame(rows)
@@ -199,6 +203,7 @@ def load(file_bytes: bytes):
     #  라인명(S)은 모델명(AB)에서 사이즈 표기 (40)(42) 뗀 것 → 사이즈 변형 묶음.
     img_map = {}
     model2line = {}
+    stock_map = {}                             # 모델명(AB) → 가용수량(AG)
     try:
         wk = wb["카테고리분류"]
         for row in wk.iter_rows(min_row=2, values_only=True):
@@ -209,22 +214,32 @@ def load(file_bytes: bytes):
                 img_map[str(k).strip()] = str(l).strip()
             if ab and s and str(ab).strip() and str(s).strip():
                 model2line[str(ab).strip()] = str(s).strip()
+            if ab and str(ab).strip() and len(row) >= 33:
+                try:
+                    stock_map[str(ab).strip()] = float(row[32] or 0)   # AG=가용수량
+                except (TypeError, ValueError):
+                    pass
     except Exception:
         pass
 
     # 병행/공식 + TOP (RAW: C=분류, F=브랜드, I=상품, J=수량, M=매출, V=이익, AA=카테고리)
     try:
         raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name="RAW", header=1,
-                            usecols=[2, 3, 5, 8, 9, 12, 21, 26])
-        raw.columns = ["분류", "쇼핑몰", "브랜드", "상품", "수량", "매출", "이익", "카테고리"]
+                            usecols=[2, 3, 5, 8, 9, 12, 21, 23, 24, 26])
+        raw.columns = ["분류", "쇼핑몰", "브랜드", "상품", "수량", "매출", "이익", "날짜", "비고", "카테고리"]
         for cc in ["수량", "매출", "이익"]:
             raw[cc] = pd.to_numeric(raw[cc], errors="coerce").fillna(0)
         # RAW 모델 → 라인명(S) 변환 (사이즈 변형 묶음)
         raw["라인명"] = raw["상품"].astype(str).str.strip().map(model2line)
         raw["라인명"] = raw["라인명"].fillna(raw["상품"].astype(str).str.strip())
+        # 필터일자: 반품/교환은 비고 안의 (YYYY-MM-DD), 그 외 출고날짜
+        _bgdt = raw["비고"].astype(str).str.extract(r"(\d{4}-\d{2}-\d{2})")[0]
+        raw["필터일자"] = pd.to_datetime(_bgdt, errors="coerce")
+        raw["필터일자"] = raw["필터일자"].fillna(pd.to_datetime(raw["날짜"], errors="coerce"))
         pc, top_brand, top_prod_bh, top_prod_gs = agg_raw(raw, img_map)
     except Exception:
-        raw = pd.DataFrame(columns=["분류", "쇼핑몰", "브랜드", "상품", "수량", "매출", "이익", "카테고리", "라인명"])
+        raw = pd.DataFrame(columns=["분류", "쇼핑몰", "브랜드", "상품", "수량", "매출", "이익",
+                                    "날짜", "비고", "카테고리", "라인명", "필터일자"])
         pc = {"병행": {"매출": 0.0, "이익": 0.0, "수익율": 0.0},
               "공식": {"매출": 0.0, "이익": 0.0, "수익율": 0.0}}
         top_brand = pd.DataFrame(columns=["수량", "매출", "이익", "객단가", "수익율", "매출비중"])
@@ -232,9 +247,12 @@ def load(file_bytes: bytes):
         top_prod_gs = pd.DataFrame(columns=["매출", "이익", "수량", "브랜드", "카테고리", "이익율"])
 
     # 병행/공식 당월 목표/달성율 (연간매출및 목표: 병행/공식 블록 합계행, 당월 목표매출 열)
+    pc_mall = {"병행": pd.DataFrame(columns=["쇼핑몰", "목표", "매출", "달성율"]),
+               "공식": pd.DataFrame(columns=["쇼핑몰", "목표", "매출", "달성율"])}
     try:
         wy = wb["연간매출및 목표"]
         tcol = 8 + (month - 1) * 3   # 1월=8열, 이후 3칸 간격 → 당월 목표매출 열
+        pcol = 8 + (prev - 1) * 3    # 전월 목표매출 열
         blk = {}
         for r in range(1, 160):
             v = wy.cell(r, 2).value
@@ -249,12 +267,35 @@ def load(file_bytes: bytes):
                     tgt = _num(wy.cell(rr + 1, tcol).value)
                     pc[label]["목표"] = tgt
                     pc[label]["달성율"] = (pc[label]["매출"] / tgt) if tgt else 0.0
+                    ptgt = _num(wy.cell(rr + 1, pcol).value)
+                    pact = _num(wy.cell(rr + 1, pcol + 1).value)
+                    pc[label]["전월 목표"] = ptgt
+                    pc[label]["전월 매출"] = pact
+                    pc[label]["전월 달성율"] = (pact / ptgt) if ptgt else 0.0
+                    # 몰별 행 (합계행 다음부터 C열 빌 때까지)
+                    _mrows = []
+                    for r2 in range(rr + 2, rr + 80):
+                        nm2 = wy.cell(r2, 3).value
+                        if nm2 is None or str(nm2).strip() == "":
+                            break
+                        if str(wy.cell(r2, 2).value or "").strip() in ("병행", "공식"):
+                            break
+                        t2 = _num(wy.cell(r2, tcol).value)
+                        a2 = _num(wy.cell(r2, tcol + 1).value)
+                        if t2 == 0 and a2 == 0:
+                            continue
+                        _mrows.append({"쇼핑몰": str(nm2).strip(), "목표": t2, "매출": a2,
+                                       "달성율": (a2 / t2) if t2 else None})
+                    pc_mall[label] = pd.DataFrame(_mrows)
                     break
     except Exception:
         pass
     for label in ["병행", "공식"]:
         pc[label].setdefault("목표", 0.0)
         pc[label].setdefault("달성율", 0.0)
+        pc[label].setdefault("전월 목표", 0.0)
+        pc[label].setdefault("전월 매출", 0.0)
+        pc[label].setdefault("전월 달성율", 0.0)
 
     # 쇼핑몰 합계행 (매출현황 5행 = 엑셀 계산된 합계)
     def s5(cc):
@@ -266,18 +307,20 @@ def load(file_bytes: bytes):
         "당월 수익율": s5(15), "달성율": s5(16),
         "전월 수량": s5(17), "전월 매출": s5(18), "전월 이익": s5(20), "전월 수익율": s5(21),
         "예상마감": s5(22), "예상달성율": (s5(22) / s5(11)) if s5(11) else None,
+        "전년대비(예상)": (s5(22) / s5(6) - 1) if s5(6) else None,
+        "전월대비(예상)": (s5(22) / s5(18) - 1) if s5(18) else None,
         "전년대비": s5(29), "전월대비": s5(31),
     }
 
     return (month, prev, prev2, day, is_last, cur_box, prev_box, prev2_box,
             cur_extra, cat_sales, df, yearly, total_row, pc, top_brand, top_prod_bh, top_prod_gs,
-            raw, img_map)
+            raw, img_map, pc_mall, stock_map, model2line)
 
 
 try:
     (month, prev, prev2, day, is_last, cur_box, prev_box, prev2_box,
      cur_extra, cat_sales, df, yearly, total_row, pc, top_brand, top_prod_bh, top_prod_gs,
-     raw, img_map) = load(_data)
+     raw, img_map, pc_mall, stock_map, model2line_g) = load(_data)
 except Exception as e:
     st.error(f"파일을 읽지 못했습니다 (매출현황/연간 시트 확인): {e}")
     st.stop()
@@ -287,20 +330,39 @@ _title_ph.title(f"📊 EC {month}월 매출 요약")
 # ── 사이드바 필터 (쇼핑몰 / 카테고리) ──────────────────
 _malls = sorted([m for m in raw["쇼핑몰"].dropna().astype(str).unique() if m.strip()])
 _cats = sorted([c for c in raw["카테고리"].dropna().astype(str).unique() if c.strip()])
+_dts = raw["필터일자"].dt.date.dropna() if len(raw) else pd.Series(dtype=object)
 with st.sidebar:
     st.header("🔎 필터")
     st.caption("TOP 브랜드 · TOP 상품 섹션에 적용")
     sel_mall = st.multiselect("쇼핑몰", _malls)
     sel_cat = st.multiselect("카테고리", _cats)
-raw_f = raw
+    sel_dt = None
+    if len(_dts):
+        _dmin, _dmax = _dts.min(), _dts.max()
+        sel_dt = st.date_input("기간", value=(_dmin, _dmax),
+                               min_value=_dmin, max_value=_dmax)
+raw_d = raw                                   # 날짜 필터 → 전역 적용
+_dt_on = False
+_d1 = _d2 = None
+if sel_dt and isinstance(sel_dt, (list, tuple)) and len(sel_dt) == 2:
+    _d1, _d2 = sel_dt
+    if _d1 != _dts.min() or _d2 != _dts.max():
+        _dcol = raw["필터일자"].dt.date
+        raw_d = raw[(_dcol >= _d1) & (_dcol <= _d2)]
+        _dt_on = True
+raw_f = raw_d                                 # + 쇼핑몰/카테고리 → TOP 전용
 if sel_mall:
     raw_f = raw_f[raw_f["쇼핑몰"].astype(str).isin(sel_mall)]
 if sel_cat:
     raw_f = raw_f[raw_f["카테고리"].astype(str).isin(sel_cat)]
-if sel_mall or sel_cat:
+if sel_mall or sel_cat or _dt_on:
     _, top_brand, top_prod_bh, top_prod_gs = agg_raw(raw_f, img_map)
-    _bits = ([f"쇼핑몰 {len(sel_mall)}개"] if sel_mall else []) + ([f"카테고리 {len(sel_cat)}개"] if sel_cat else [])
-    st.info("🔎 필터: " + " / ".join(_bits) + "  — TOP 브랜드·TOP 상품에만 반영")
+    _bits = (([f"{_d1.strftime('%m/%d')}~{_d2.strftime('%m/%d')}"] if _dt_on else [])
+             + ([f"쇼핑몰 {len(sel_mall)}개"] if sel_mall else [])
+             + ([f"카테고리 {len(sel_cat)}개"] if sel_cat else []))
+    _scope = ("전체 반영 · 전년/전월/목표/예상 비교는 월 단위라 제외" if _dt_on
+              else "TOP 브랜드·TOP 상품에만 반영")
+    st.info("🔎 필터: " + " / ".join(_bits) + f"  — {_scope}")
 
 if cur_box["매출"] == 0 and df["당월 매출"].sum() == 0:
     st.warning("숫자가 전부 0이에요. EC매출 결과는 **엑셀에서 한 번 열어 계산된 뒤 저장**해야 값이 채워집니다.")
@@ -308,16 +370,26 @@ if cur_box["매출"] == 0 and df["당월 매출"].sum() == 0:
 cur_label = f"{month}월" if is_last else f"{month}월(~{month}/{day})"
 
 # ── 종합 ───────────────────────────────────────────────
-title = f"{month}월 매출" if is_last else f"~{month}/{day} 까지 매출"
-st.subheader(f"📊 {title}")
-c = st.columns(4 if is_last else 5)
-c[0].metric("매출", f"{cur_box['매출']/1e8:,.2f}억")
-c[1].metric("이익", f"{cur_box['이익']/1e8:,.2f}억", f"수익율 {cur_box['수익율']:.1%}")
-c[2].metric("목표", f"{cur_extra['목표']/1e8:,.2f}억")
-c[3].metric("달성율", f"{cur_extra['달성율']:.1%}")
-if not is_last:
-    _fc_ach = (cur_extra['예상'] / cur_extra['목표']) if cur_extra['목표'] else 0
-    c[4].metric("예상마감", f"{cur_extra['예상']/1e8:,.2f}억", f"달성율 {_fc_ach:.1%}")
+if _dt_on:
+    _ps = float(raw_d["매출"].sum())
+    _pp = float(raw_d["이익"].sum())
+    st.subheader(f"📊 {_d1.strftime('%m/%d')}~{_d2.strftime('%m/%d')} 매출")
+    c = st.columns(4)
+    c[0].metric("매출", f"{_ps/1e8:,.2f}억")
+    c[1].metric("이익", f"{_pp/1e8:,.2f}억", f"수익율 {(_pp/_ps if _ps else 0):.1%}")
+    c[2].metric("수량", f"{raw_d['수량'].sum():,.0f}개")
+    c[3].metric("일평균 매출", f"{_ps/max((_d2-_d1).days+1,1)/1e8:,.2f}억")
+else:
+    title = f"{month}월 매출" if is_last else f"~{month}/{day} 까지 매출"
+    st.subheader(f"📊 {title}")
+    c = st.columns(4 if is_last else 5)
+    c[0].metric("매출", f"{cur_box['매출']/1e8:,.2f}억")
+    c[1].metric("이익", f"{cur_box['이익']/1e8:,.2f}억", f"수익율 {cur_box['수익율']:.1%}")
+    c[2].metric("목표", f"{cur_extra['목표']/1e8:,.2f}억")
+    c[3].metric("달성율", f"{cur_extra['달성율']:.1%}")
+    if not is_last:
+        _fc_ach = (cur_extra['예상'] / cur_extra['목표']) if cur_extra['목표'] else 0
+        c[4].metric("예상마감", f"{cur_extra['예상']/1e8:,.2f}억", f"달성율 {_fc_ach:.1%}")
 
 # ── 월별(작게) + 카테고리별 나란히 ─────────────────────
 c_left, c_right = st.columns([1, 1.35])
@@ -337,25 +409,54 @@ with c_left:
         hide_index=True, use_container_width=True,
     )
     st.markdown("##### 🔀 병행 / 공식 (당월)")
-    pcdf = pd.DataFrame([
-        {"구분": "병행", "목표": pc["병행"]["목표"], "매출": pc["병행"]["매출"],
-         "이익": pc["병행"]["이익"], "수익율": pc["병행"]["수익율"], "달성율": pc["병행"]["달성율"]},
-        {"구분": "공식", "목표": pc["공식"]["목표"], "매출": pc["공식"]["매출"],
-         "이익": pc["공식"]["이익"], "수익율": pc["공식"]["수익율"], "달성율": pc["공식"]["달성율"]},
-    ])
-    st.dataframe(
-        pcdf.style.format({"목표": "{:,.0f}", "매출": "{:,.0f}", "이익": "{:,.0f}",
-                           "수익율": "{:.1%}", "달성율": "{:.1%}"}, na_rep="-"),
-        hide_index=True, use_container_width=True,
-    )
+    if _dt_on:
+        _g2 = raw_d.groupby("분류")[["매출", "이익"]].sum()
+        _rows2 = []
+        for _cls in ["병행", "공식"]:
+            _s2 = float(_g2.loc[_cls, "매출"]) if _cls in _g2.index else 0.0
+            _p2 = float(_g2.loc[_cls, "이익"]) if _cls in _g2.index else 0.0
+            _rows2.append({"구분": _cls, "매출": _s2, "이익": _p2,
+                           "수익율": _p2 / _s2 if _s2 else 0.0})
+        pcdf = pd.DataFrame(_rows2)
+        st.dataframe(
+            pcdf.style.format({"매출": "{:,.0f}", "이익": "{:,.0f}", "수익율": "{:.1%}"},
+                              na_rep="-"),
+            hide_index=True, use_container_width=True,
+        )
+    else:
+        pcdf = pd.DataFrame([
+            {"구분": "병행", "목표": pc["병행"]["목표"], "매출": pc["병행"]["매출"],
+             "이익": pc["병행"]["이익"], "수익율": pc["병행"]["수익율"], "달성율": pc["병행"]["달성율"]},
+            {"구분": "공식", "목표": pc["공식"]["목표"], "매출": pc["공식"]["매출"],
+             "이익": pc["공식"]["이익"], "수익율": pc["공식"]["수익율"], "달성율": pc["공식"]["달성율"]},
+        ])
+        st.dataframe(
+            pcdf.style.format({"목표": "{:,.0f}", "매출": "{:,.0f}", "이익": "{:,.0f}",
+                               "수익율": "{:.1%}", "달성율": "{:.1%}"}, na_rep="-"),
+            hide_index=True, use_container_width=True,
+        )
 with c_right:
     st.markdown("##### 🗂 카테고리별 매출")
-    st.dataframe(
-        cat_sales.style.format({
-            "매출": "{:,.0f}", "이익": "{:,.0f}", "수익율": "{:.1%}", "재고원가": "{:,.0f}",
-        }),
-        hide_index=True, use_container_width=True, height=350,
-    )
+    if _dt_on:
+        _cs = (raw_d.groupby("카테고리")
+               .agg(매출=("매출", "sum"), 이익=("이익", "sum"))
+               .sort_values("매출", ascending=False).reset_index()
+               .rename(columns={"카테고리": "구분"}))
+        _cs["수익율"] = (_cs["이익"] / _cs["매출"].replace(0, pd.NA)).fillna(0)
+        _tot = pd.DataFrame([{"구분": "총합", "매출": _cs["매출"].sum(), "이익": _cs["이익"].sum(),
+                              "수익율": (_cs["이익"].sum() / _cs["매출"].sum()) if _cs["매출"].sum() else 0}])
+        _cs = pd.concat([_cs, _tot], ignore_index=True)
+        st.dataframe(
+            _cs.style.format({"매출": "{:,.0f}", "이익": "{:,.0f}", "수익율": "{:.1%}"}),
+            hide_index=True, use_container_width=True, height=350,
+        )
+    else:
+        st.dataframe(
+            cat_sales.style.format({
+                "매출": "{:,.0f}", "이익": "{:,.0f}", "수익율": "{:.1%}", "재고원가": "{:,.0f}",
+            }),
+            hide_index=True, use_container_width=True, height=350,
+        )
 
 # ── 목표 (연간 월별 + 누적 달성율) ────────────────────
 st.subheader("📈 목표")
@@ -378,101 +479,182 @@ fig.update_layout(barmode="group", height=360, margin=dict(t=20, b=20, l=20, r=2
 st.plotly_chart(fig, use_container_width=True)
 
 # ── 쇼핑몰별 표 (원본 색 + 순서) ───────────────────────
-st.subheader(f"🏬 쇼핑몰별 ({cur_label})")
-_ca, _cb = st.columns(2)
-hide_zero = _ca.checkbox("매출 0인 쇼핑몰 숨기기", value=True)
-show_detail = _cb.checkbox("이익/수량 보기 (전년/당월/전월)", value=False)
-view = df[df["당월 매출"] > 0] if hide_zero else df
-view = view.sort_values("당월 매출", ascending=False).reset_index(drop=True)
-# 맨 위에 합계 행
-view = pd.concat([pd.DataFrame([total_row]), view], ignore_index=True)
-st.caption(f"{len(view)-1}개 쇼핑몰 · 당월 매출 큰 순  (⬛합계 🟦당월 🟨전월 ⬜전년)")
+if _dt_on:
+    st.subheader(f"🏬 쇼핑몰별 ({_d1.strftime('%m/%d')}~{_d2.strftime('%m/%d')})")
+    hide_zero = st.checkbox("매출 0인 쇼핑몰 숨기기", value=True)
+    _mv = (raw_d.groupby("쇼핑몰")
+           .agg(수량=("수량", "sum"), 매출=("매출", "sum"), 이익=("이익", "sum"))
+           .sort_values("매출", ascending=False).reset_index())
+    if hide_zero:
+        _mv = _mv[_mv["매출"] != 0]
+    _mv["수익율"] = (_mv["이익"] / _mv["매출"].replace(0, pd.NA)).fillna(0)
+    _mtot = pd.DataFrame([{"쇼핑몰": "합계", "수량": _mv["수량"].sum(), "매출": _mv["매출"].sum(),
+                           "이익": _mv["이익"].sum(),
+                           "수익율": (_mv["이익"].sum() / _mv["매출"].sum()) if _mv["매출"].sum() else 0}])
+    _mv = pd.concat([_mtot, _mv], ignore_index=True)
+    st.caption(f"{len(_mv)-1}개 쇼핑몰 · 기간 매출 큰 순 (전년/전월/목표 비교는 월 단위라 제외)")
+    st.dataframe(
+        _mv.style.format({"수량": "{:,.0f}", "매출": "{:,.0f}", "이익": "{:,.0f}", "수익율": "{:.1%}"}),
+        hide_index=True, use_container_width=True,
+        height=min(600, 60 + 35 * len(_mv)),
+    )
+    view = _mv  # CSV 다운로드용
+else:
+    st.subheader(f"🏬 쇼핑몰별 ({cur_label})")
+    _ca, _cb, _cc = st.columns(3)
+    hide_zero = _ca.checkbox("매출 0인 쇼핑몰 숨기기", value=True)
+    show_detail = _cb.checkbox("이익/수량 보기 (전년/당월/전월)", value=False)
+    show_fc = _cc.checkbox("예상 보기 (마감/달성율/대비)", value=False)
+    view = df[df["당월 매출"] > 0] if hide_zero else df
+    view = view.sort_values("당월 매출", ascending=False).reset_index(drop=True)
+    # 맨 위에 합계 행
+    view = pd.concat([pd.DataFrame([total_row]), view], ignore_index=True)
+    st.caption(f"{len(view)-1}개 쇼핑몰 · 당월 매출 큰 순  (⬛합계 🟦당월 🟨전월 ⬜전년)")
 
-LY = ["전년 수량", "전년 매출", "전년 이익", "전년 수익율"]
-CUR = ["당월 수량", "목표", "당월 매출", "당월 이익", "당월 수익율", "달성율"]
-PV = ["전월 수량", "전월 매출", "전월 이익", "전월 수익율"]
-money = ["전년 매출", "전년 이익", "당월 매출", "목표", "당월 이익", "전월 매출", "전월 이익", "예상마감"]
-qty = ["전년 수량", "당월 수량", "전월 수량"]
-pct = ["전년 수익율", "당월 수익율", "전월 수익율", "달성율", "예상달성율"]
-gpct = ["전년대비", "전월대비"]
+    LY = ["전년 수량", "전년 매출", "전년 이익", "전년 수익율"]
+    CUR = ["당월 수량", "목표", "당월 매출", "당월 이익", "당월 수익율", "달성율"]
+    PV = ["전월 수량", "전월 매출", "전월 이익", "전월 수익율"]
+    money = ["전년 매출", "전년 이익", "당월 매출", "목표", "당월 이익", "전월 매출", "전월 이익", "예상마감"]
+    qty = ["전년 수량", "당월 수량", "전월 수량"]
+    pct = ["전년 수익율", "당월 수익율", "전월 수익율", "달성율", "예상달성율"]
+    gpct = ["전년대비(예상)", "전월대비(예상)", "전년대비", "전월대비"]
 
-# 표 컬럼 표시 순서 (CUR 순서 반영: 목표 → 당월 매출) + 이익·수량 기본 숨김
-_drop = [] if show_detail else ["전년 수량", "전년 이익", "당월 수량", "당월 이익", "전월 수량", "전월 이익"]
-_order = ["쇼핑몰"] + LY + CUR + PV + ([] if is_last else ["예상마감", "예상달성율"]) + gpct
-view = view[[c for c in _order if c in view.columns and c not in _drop]]
+    # 표 컬럼 표시 순서 (CUR 순서 반영: 목표 → 당월 매출) + 이익·수량 기본 숨김
+    _drop = [] if show_detail else ["전년 수량", "전년 이익", "당월 수량", "당월 이익", "전월 수량", "전월 이익"]
+    if is_last or not show_fc:
+        _drop += ["예상마감", "예상달성율", "전년대비(예상)", "전월대비(예상)"]
+    _order = ["쇼핑몰"] + LY + CUR + PV + ["예상마감", "예상달성율"] + gpct
+    view = view[[c for c in _order if c in view.columns and c not in _drop]]
 
-def bg(data):
-    s = pd.DataFrame("", index=data.index, columns=data.columns)
-    for cc in CUR:
-        if cc in s.columns:
-            s[cc] = "background-color:#DCE6F7"
-    for cc in PV:
-        if cc in s.columns:
-            s[cc] = "background-color:#FCF4DC"
-    for cc in LY:
-        if cc in s.columns:
-            s[cc] = "background-color:#F4F4F4"
-    if len(data) > 0:                       # 합계 행(0) 강조
-        s.iloc[0] = ["background-color:#D1D5DB; font-weight:700"] * len(data.columns)
-    return s
+    def bg(data):
+        s = pd.DataFrame("", index=data.index, columns=data.columns)
+        for cc in CUR:
+            if cc in s.columns:
+                s[cc] = "background-color:#DCE6F7"
+        for cc in PV:
+            if cc in s.columns:
+                s[cc] = "background-color:#FCF4DC"
+        for cc in LY:
+            if cc in s.columns:
+                s[cc] = "background-color:#F4F4F4"
+        if len(data) > 0:                       # 합계 행(0) 강조
+            s.iloc[0] = ["background-color:#D1D5DB; font-weight:700"] * len(data.columns)
+        return s
 
-def neg_red(v):
+    def neg_red(v):
+        try:
+            return "color:#c00; font-weight:600" if float(v) < 0 else ""
+        except (TypeError, ValueError):
+            return ""
+
+    def _gp(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return "-"
+        if pd.isna(f) or f == 0:
+            return "-"
+        return f"{f:+.1%}"
+
+    fmt = {**{cc: "{:,.0f}" for cc in money + qty},
+           **{cc: "{:.1%}" for cc in pct},
+           **{cc: _gp for cc in gpct}}
+    fmt = {k: v for k, v in fmt.items() if k in view.columns}
+    sty = view.style.apply(bg, axis=None).format(fmt, na_rep="-")
+    sty = sty.set_properties(**{"text-align": "center"})
+    sty = sty.set_table_styles([
+        {"selector": "", "props": [("border-collapse", "separate"), ("border-spacing", "0")]},
+        {"selector": "th", "props": [("text-align", "center"), ("background-color", "#eef2f7"),
+                                     ("padding", "5px 8px"), ("white-space", "nowrap"),
+                                     ("position", "sticky"), ("top", "33px"), ("z-index", "3")]},
+        {"selector": "td", "props": [("text-align", "center"), ("padding", "5px 8px"),
+                                     ("white-space", "nowrap")]},
+        {"selector": "tbody tr:first-child td",
+         "props": [("position", "sticky"), ("top", "66px"), ("z-index", "2")]},
+    ])
+    _gpct_in = [c for c in gpct if c in view.columns]
     try:
-        return "color:#c00; font-weight:600" if float(v) < 0 else ""
-    except (TypeError, ValueError):
-        return ""
+        sty = sty.map(neg_red, subset=_gpct_in)
+    except AttributeError:
+        sty = sty.applymap(neg_red, subset=_gpct_in)
+    try:
+        html = sty.hide(axis="index").to_html()
+    except (AttributeError, TypeError):
+        html = sty.hide_index().to_html()
+    # 그룹 헤더 행 (전년/당월/전월/마감) — 2단 헤더
+    _GROUP = {
+        "전년 수량": "전년", "전년 매출": "전년", "전년 이익": "전년", "전년 수익율": "전년",
+        "당월 수량": "당월", "목표": "당월", "당월 매출": "당월", "당월 이익": "당월",
+        "당월 수익율": "당월", "달성율": "당월",
+        "전월 수량": "전월", "전월 매출": "전월", "전월 이익": "전월", "전월 수익율": "전월",
+        "예상마감": "마감", "예상달성율": "마감", "전년대비(예상)": "마감", "전월대비(예상)": "마감",
+        "전년대비": "마감", "전월대비": "마감",
+    }
+    _gcolors = {"전년": "#E5E7EB", "당월": "#C7D7F0", "전월": "#F5E9C8", "마감": "#E8EDF3"}
+    _gc = {}
+    for _c in view.columns:
+        _g = _GROUP.get(_c, "")
+        _gc[_g] = _gc.get(_g, 0) + 1
+    _gcells = ""
+    for _g, _n in _gc.items():
+        if _g == "":
+            _gcells += ('<th style="background-color:#eef2f7;position:sticky;top:0;'
+                        'z-index:5;border:1px solid #e5e7eb;"></th>')
+        else:
+            _gcells += (f'<th colspan="{_n}" style="text-align:center;font-weight:700;'
+                        f'background-color:{_gcolors.get(_g, "#eef2f7")};padding:6px 8px;'
+                        f'position:sticky;top:0;z-index:5;border:1px solid #e5e7eb;">{_g}</th>')
+    html = html.replace("<thead>", f'<thead><tr>{_gcells}</tr>', 1)
+    st.markdown(
+        f'<div style="overflow:auto; max-height:600px; font-size:13px; '
+        f'border:1px solid #e5e7eb; border-radius:8px">{html}</div>',
+        unsafe_allow_html=True,
+    )
 
-fmt = {**{cc: "{:,.0f}" for cc in money + qty},
-       **{cc: "{:.1%}" for cc in pct},
-       **{cc: "{:+.1%}" for cc in gpct}}
-sty = view.style.apply(bg, axis=None).format(fmt)
-sty = sty.set_properties(**{"text-align": "center"})
-sty = sty.set_table_styles([
-    {"selector": "", "props": [("border-collapse", "separate"), ("border-spacing", "0")]},
-    {"selector": "th", "props": [("text-align", "center"), ("background-color", "#eef2f7"),
-                                 ("padding", "5px 8px"), ("white-space", "nowrap"),
-                                 ("position", "sticky"), ("top", "33px"), ("z-index", "3")]},
-    {"selector": "td", "props": [("text-align", "center"), ("padding", "5px 8px"),
-                                 ("white-space", "nowrap")]},
-    {"selector": "tbody tr:first-child td",
-     "props": [("position", "sticky"), ("top", "66px"), ("z-index", "2")]},
-])
-try:
-    sty = sty.map(neg_red, subset=gpct)
-except AttributeError:
-    sty = sty.applymap(neg_red, subset=gpct)
-try:
-    html = sty.hide(axis="index").to_html()
-except (AttributeError, TypeError):
-    html = sty.hide_index().to_html()
-# 그룹 헤더 행 (전년/당월/전월/마감) — 2단 헤더
-_GROUP = {
-    "전년 수량": "전년", "전년 매출": "전년", "전년 이익": "전년", "전년 수익율": "전년",
-    "당월 수량": "당월", "목표": "당월", "당월 매출": "당월", "당월 이익": "당월",
-    "당월 수익율": "당월", "달성율": "당월",
-    "전월 수량": "전월", "전월 매출": "전월", "전월 이익": "전월", "전월 수익율": "전월",
-    "예상마감": "마감", "예상달성율": "마감", "전년대비": "마감", "전월대비": "마감",
-}
-_gcolors = {"전년": "#E5E7EB", "당월": "#C7D7F0", "전월": "#F5E9C8", "마감": "#E8EDF3"}
-_gc = {}
-for _c in view.columns:
-    _g = _GROUP.get(_c, "")
-    _gc[_g] = _gc.get(_g, 0) + 1
-_gcells = ""
-for _g, _n in _gc.items():
-    if _g == "":
-        _gcells += ('<th style="background-color:#eef2f7;position:sticky;top:0;'
-                    'z-index:5;border:1px solid #e5e7eb;"></th>')
-    else:
-        _gcells += (f'<th colspan="{_n}" style="text-align:center;font-weight:700;'
-                    f'background-color:{_gcolors.get(_g, "#eef2f7")};padding:6px 8px;'
-                    f'position:sticky;top:0;z-index:5;border:1px solid #e5e7eb;">{_g}</th>')
-html = html.replace("<thead>", f'<thead><tr>{_gcells}</tr>', 1)
-st.markdown(
-    f'<div style="overflow:auto; max-height:600px; font-size:13px; '
-    f'border:1px solid #e5e7eb; border-radius:8px">{html}</div>',
-    unsafe_allow_html=True,
-)
+    # ── 병행/공식 몰별 (목표/매출/달성율) ──────────────
+    st.markdown(f"##### 🔀 병행 / 공식 몰별 ({cur_label})")
+
+    def _pc_mall_table(label):
+        _mv2 = pc_mall[label].copy()
+        if not len(_mv2):
+            st.caption("데이터 없음")
+            return
+        # 수익: RAW(분류×쇼핑몰 이익 합)에서
+        _pm = (raw[raw["분류"] == label].groupby("쇼핑몰")[["매출", "이익"]].sum())
+        _mv2["수익"] = _mv2["쇼핑몰"].map(_pm["이익"]).fillna(0.0)
+        _rs = _mv2["쇼핑몰"].map(_pm["매출"]).fillna(0.0)
+        _mv2["수익율"] = (_mv2["수익"] / _rs.replace(0, pd.NA)).fillna(0)
+        _mv2 = _mv2.sort_values("매출", ascending=False).reset_index(drop=True)
+        _t2 = float(_mv2["목표"].sum())
+        _a2 = float(_mv2["매출"].sum())
+        _p2 = float(_mv2["수익"].sum())
+        _rs2 = float(_rs.sum())
+        _tot2 = pd.DataFrame([{"쇼핑몰": "합계", "목표": _t2, "매출": _a2,
+                               "수익": _p2, "수익율": (_p2 / _rs2) if _rs2 else None,
+                               "달성율": (_a2 / _t2) if _t2 else None}])
+        _mv2 = pd.concat([_tot2, _mv2], ignore_index=True)
+        _mv2 = _mv2[["쇼핑몰", "목표", "매출", "수익", "수익율", "달성율"]]
+
+        def _mb(data):
+            s = pd.DataFrame("", index=data.index, columns=data.columns)
+            if len(data) > 0:
+                s.iloc[0] = ["background-color:#D1D5DB; font-weight:700"] * len(data.columns)
+            return s
+        st.dataframe(
+            _mv2.style.apply(_mb, axis=None).format(
+                {"목표": "{:,.0f}", "매출": "{:,.0f}", "수익": "{:,.0f}",
+                 "수익율": "{:.1%}", "달성율": "{:.1%}"}, na_rep="-"),
+            hide_index=True, use_container_width=True,
+            height=min(560, 60 + 35 * len(_mv2)),
+        )
+
+    _pcc1, _pcc2 = st.columns(2)
+    with _pcc1:
+        st.markdown("**🟦 병행**")
+        _pc_mall_table("병행")
+    with _pcc2:
+        st.markdown("**🟩 공식**")
+        _pc_mall_table("공식")
 
 # ── TOP10 브랜드 (도넛 + 표) ───────────────────────────
 st.subheader("🏷 TOP 10 브랜드")
@@ -574,3 +756,87 @@ with _tab_gs:
 csv = view.to_csv(index=False).encode("utf-8-sig")
 st.download_button("⬇ 쇼핑몰별 표 CSV로 받기", csv,
                    file_name=f"EC매출_{month}월_쇼핑몰별.csv", mime="text/csv")
+
+# ── 검색 (라인명/모델명/브랜드 → 몰별 집계 + 출고 상세) ─────
+st.subheader("🔍 상품 검색")
+_q = st.text_input("라인명 / 모델명 / 브랜드 검색",
+                   placeholder="예: 1DR, X08004, DIESEL … (부분 일치, 대소문자 무관)")
+if _q.strip():
+    _ql = _q.strip().lower()
+    _mask = pd.Series(False, index=raw_d.index)
+    for _sc in ["라인명", "상품", "브랜드"]:
+        _mask |= raw_d[_sc].astype(str).str.lower().str.contains(_ql, regex=False)
+    _hit = raw_d[_mask].copy()
+    if _hit.empty:
+        st.warning(f"'{_q}' 에 해당하는 라인명/모델명/브랜드가 없습니다. ({month}월 기준)")
+    else:
+        _lines = sorted(_hit["라인명"].astype(str).unique())
+        st.caption(f"검색 결과: 라인 **{len(_lines)}건** ({', '.join(_lines[:10])}"
+                   + (" …" if len(_lines) > 10 else "") + f") · {month}월 전체")
+        _tot_s = float(_hit["매출"].sum())
+        _tot_p = float(_hit["이익"].sum())
+        # 남은 재고: 검색된 모델들 + 같은 라인의 모든 사이즈(모델) 가용수량 합
+        _hit_models = set(_hit["상품"].astype(str).str.strip())
+        _hit_lines = set(_hit["라인명"].astype(str).str.strip())
+        _stock_models = set(_hit_models)
+        for _m3, _l3 in model2line_g.items():
+            if _l3 in _hit_lines:
+                _stock_models.add(_m3)
+        _stock = sum(stock_map.get(_m3, 0) for _m3 in _stock_models)
+        _sc1, _sc2, _sc3, _sc4, _sc5 = st.columns(5)
+        _sc1.metric("매출", f"{_tot_s:,.0f}")
+        _sc2.metric("수익", f"{_tot_p:,.0f}")
+        _sc3.metric("수익율", f"{(_tot_p/_tot_s if _tot_s else 0):.1%}")
+        _sc4.metric("수량", f"{_hit['수량'].sum():,.0f}개")
+        _sc5.metric("남은 재고", f"{_stock:,.0f}개")
+        # 몰별 집계 (어느 몰에서 얼마나 팔렸는지)
+        st.markdown("**몰별 집계**")
+        _mt = (_hit.groupby("쇼핑몰")
+               .agg(수량=("수량", "sum"), 매출=("매출", "sum"), 수익=("이익", "sum"))
+               .sort_values("매출", ascending=False).reset_index())
+        _mt["수익율"] = (_mt["수익"] / _mt["매출"].replace(0, pd.NA)).fillna(0)
+        _mt["매출비중"] = (_mt["매출"] / _tot_s) if _tot_s else 0.0
+        _mt.insert(0, "#", range(1, len(_mt) + 1))
+        st.dataframe(
+            _mt.style.format({"수량": "{:,.0f}", "매출": "{:,.0f}", "수익": "{:,.0f}",
+                              "수익율": "{:.1%}", "매출비중": "{:.1%}"}),
+            hide_index=True, use_container_width=True,
+            height=min(560, 60 + 35 * len(_mt)),
+        )
+        # 출고 상세 (개별 판매 건)
+        _dt = _hit[["날짜", "쇼핑몰", "브랜드", "상품", "수량", "매출", "이익", "비고"]].copy()
+        _dt["판매단가"] = (_dt["매출"] / _dt["수량"].replace(0, pd.NA)).fillna(0)
+        _dt["수익"] = _dt["이익"]
+        _dt["수익율"] = (_dt["이익"] / _dt["매출"].replace(0, pd.NA)).fillna(0)
+        _dt = _dt.sort_values("날짜", ascending=False).reset_index(drop=True)
+        _dt["날짜"] = pd.to_datetime(_dt["날짜"], errors="coerce").dt.strftime("%m-%d")
+        _dt = _dt[["날짜", "쇼핑몰", "브랜드", "상품", "수량", "판매단가", "매출", "수익", "수익율", "비고"]]
+        st.markdown(f"**출고 상세** · {len(_dt):,}건")
+        st.dataframe(
+            _dt.style.format({"수량": "{:,.0f}", "판매단가": "{:,.0f}",
+                              "매출": "{:,.0f}", "수익": "{:,.0f}", "수익율": "{:.1%}"}, na_rep="-"),
+            hide_index=True, use_container_width=True, height=560,
+        )
+
+# ── 이미지 없는 라인명 다운로드 (맨밑 구석) ─────────────
+st.divider()
+if len(raw_d):
+    _ln = (raw_d.groupby("라인명")
+           .agg(매출=("매출", "sum"), 수량=("수량", "sum"),
+                브랜드=("브랜드", "first"), 카테고리=("카테고리", "first"))
+           .reset_index())
+    _ms2 = raw_d.groupby(["라인명", "상품"])["매출"].sum().reset_index()
+    _rep2 = _ms2.loc[_ms2.groupby("라인명")["매출"].idxmax()].set_index("라인명")["상품"]
+    _ln["대표모델"] = _ln["라인명"].map(_rep2)
+
+    def _has_img(row):
+        return bool(img_map.get(str(row["라인명"]).strip(), "")
+                    or img_map.get(str(row["대표모델"]).strip(), ""))
+    _noimg = _ln[~_ln.apply(_has_img, axis=1)].sort_values("매출", ascending=False)
+    _noimg = _noimg[["라인명", "대표모델", "브랜드", "카테고리", "수량", "매출"]]
+    _nic1, _nic2 = st.columns([3, 1])
+    _nic1.caption(f"🖼 이미지 매칭 안 되는 라인: **{len(_noimg):,}개** / 전체 {len(_ln):,}개 "
+                  f"(카테고리분류 K:L에 추가하면 TOP30 이미지가 떠요)")
+    _nic2.download_button("⬇ 이미지 없는 라인 CSV",
+                          _noimg.to_csv(index=False).encode("utf-8-sig"),
+                          file_name=f"이미지없는라인_{month}월.csv", mime="text/csv")
